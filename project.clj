@@ -1,4 +1,4 @@
-(defproject metabase/athena-driver "0.3.1-athena-jdbc-2.0.7"
+(defproject metabase/datasette-driver "0.0.1-SNAPSHOT"
   :min-lein-version "2.5.0"
 
   :aliases
