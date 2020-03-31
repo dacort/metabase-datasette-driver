@@ -1,13 +1,19 @@
 (ns metabase.driver.datasette
-    (:require [clj-http.client :as client]
-              [clojure.tools.logging :as log]
-              [metabase.query-processor.store :as qp.store]
-              [metabase.driver :as driver]))
+  (:require [clj-http.client :as client]
+            [clojure.tools.logging :as log]
+            [metabase.query-processor.store :as qp.store]
+            [metabase.driver :as driver]
+            [metabase.query-processor.interface :as qp.i]
+            [metabase.mbql.util :as mbql.u]
+            [metabase.query-processor.util :as qputil]
+            [metabase.driver.sql.util.unprepare :as unprepare]
+            [metabase.query-processor.context :as context]
+            [metabase.query-processor.reducible :as qp.reducible]))
   
-  (driver/register! :datasette)
+(driver/register! :datasette, :parent :sqlite)
   
-  (defmethod driver/display-name :datasette [_]
-    "Datasette")
+(defmethod driver/display-name :datasette [_]
+  "Datasette")
   
 ; TODO: Ensure we can connect to the datasette endpoint and that's valid
 (defmethod driver/can-connect? :datasette [_ _]
@@ -24,7 +30,7 @@
       (log/info "Request:" url query)
       (let [resp (client/request {:method            :get
                                   :url               url
-                                  :query-params      {"query" query}
+                                  :query-params      query
                                   :accept            :json
                                   :as                :json
                                   :throw-exceptions  false})
@@ -41,6 +47,7 @@
           500 (throw (Exception. (format "Internal server error: %s" body)))
           :else (throw (Exception. (format "Unknown error. Body: %s" body))))))))
 
+
 (defn- get-endpoint-data
   "Get a datasette definition from an endpoint URL."
   [{{:keys [datasette_endpoint]} :details, :as database}]
@@ -48,23 +55,64 @@
         body   (:body resp)]
     body))
 
-; Read the datasette endpoint and pull out the table and schema
+(defn- get-database-json
+  "Retrieve the database definition from the Datasette endpoint."
+  [{{:keys [datasette_endpoint]} :details, :as database}]
+  (let [db_url  (format "%s.json" datasette_endpoint)
+        resp    (make-request db_url nil database)]
+    (:body resp)))
+
+(defn- get-table-json
+  "Retrieve the table definition from the Datasette endpoint."
+  [{{:keys [datasette_endpoint]} :details, :as database}
+   table]
+  (let [db_url  (format "%s/%s.json" datasette_endpoint (:name table))
+        resp    (make-request db_url nil database)]
+    (:body resp))
+  )
+
+; Read the datasette endpoint and pull out the table name
 (defmethod driver/describe-database :datasette [_ database]
-  (let [datasette-def (get-endpoint-data database)]
-  {:tables #{{:name (:table datasette-def)
-              :schema nil
-              :description (:human_description_en datasette-def)}}}))
+  (let [datasette-def (get-database-json database)]
+  {:tables (set (for [table-def (:tables datasette-def)] {:name (:name table-def), :schema nil}))}))
 
 ;;; ----------------------------- describe-table -------------------------------
 (defmethod driver/describe-table :datasette
   [_ database table]
-  {:name   (:name table)
-   :schema (:schema table)
-   :fields (set (for [field (:columns (get-endpoint-data database))]
-                  {:name field
-                   :base-type :type/Text
-                   :database-type "some.Random.String"}))}) ; Is database-type the raw type from the DB?
+  (let [table-def     (get-table-json database table)]
+    {:name        (:name table)
+     :schema      (:schema table)
+     :description (:human_description_en table-def)
+     :fields      (set (for [field (:columns table-def)]
+                    {:name field
+                     :base-type :type/Text
+                     :database-type "some.Random.String"}))} ; Is database-type the raw type from the DB?
+    )
+  )
 
 ;;; --------------------------------- query execution ------------------------------------------------------------
-(defmethod driver/mbql->native :datasette [_ query]
-  (log/info "MBQL:" query))
+
+; We need to override the execution here to send the SQL query to the Datasette endpoint
+;(defmethod driver/execute-reducible-query :datasette [driver query context respond]
+;  [driver {{sql :query, params :params} :native, :as outer-query} context respond]
+;  {:pre [(string? sql) (seq sql)]}
+;  (let [remark   (qputil/query->remark outer-query)
+;        sql      (str "-- " remark "\n" sql)
+;        max-rows (or (mbql.u/query->max-rows-limit outer-query)
+;                     qp.i/absolute-max-results)]
+;    (log/info sql)))
+(defmethod driver/execute-reducible-query :datasette
+  [driver
+   {{sql :query, params :params} :native
+    query-type                   :type
+    :as                          outer-query}
+   context
+   respond]
+  (let [sql     (str "-- "
+                     (qputil/query->remark outer-query) "\n"
+                     (unprepare/unprepare driver (cons sql params)))
+        endpoint (:datasette_endpoint (:details (qp.store/database)))]
+    (log/info sql endpoint)
+    (let [response (:body (make-request (format "%s.json" endpoint), {:sql sql}, nil))]
+      (respond {:cols (for [key (:columns response)] {:name key})}
+               (lazy-cat (:rows response))))))
