@@ -79,28 +79,29 @@
 ;;; ----------------------------- describe-table -------------------------------
 (defmethod driver/describe-table :datasette
   [_ database table]
-  (let [table-def     (get-table-json database table)]
-    {:name        (:name table)
-     :schema      (:schema table)
-     :description (:human_description_en table-def)
-     :fields      (set (for [field (:columns table-def)]
-                    {:name field
-                     :base-type :type/Text
-                     :database-type "some.Random.String"}))} ; Is database-type the raw type from the DB?
-    )
+  (let [table-def     (get-table-json database table)
+        res           (merge {:name   (:name table)
+                              :schema (:schema table)
+                              :fields (set (for [field (:columns table-def)]
+                                             {:name field
+                                              :base-type :type/Text
+                                              :database-type "some.Random.String"}))} ; Is database-type the raw type from the DB?
+                             (when-let [val (if-not (clojure.string/blank? (:description table-def)) (:description table-def))]
+                               {:description val}))]
+    res)
   )
+
+(defn create-record [data]
+  (let [res (merge {:username (data :username)
+                    :first-name (get-in data [:user-info :name :first])
+                    :last-name (get-in data [:user-info :name :last])}
+                   (when-let [gender (get-in data [:user-info :sex])]
+                     {:gender gender}))]
+    res))
 
 ;;; --------------------------------- query execution ------------------------------------------------------------
 
 ; We need to override the execution here to send the SQL query to the Datasette endpoint
-;(defmethod driver/execute-reducible-query :datasette [driver query context respond]
-;  [driver {{sql :query, params :params} :native, :as outer-query} context respond]
-;  {:pre [(string? sql) (seq sql)]}
-;  (let [remark   (qputil/query->remark outer-query)
-;        sql      (str "-- " remark "\n" sql)
-;        max-rows (or (mbql.u/query->max-rows-limit outer-query)
-;                     qp.i/absolute-max-results)]
-;    (log/info sql)))
 (defmethod driver/execute-reducible-query :datasette
   [driver
    {{sql :query, params :params} :native
