@@ -3,12 +3,8 @@
             [clojure.tools.logging :as log]
             [metabase.query-processor.store :as qp.store]
             [metabase.driver :as driver]
-            [metabase.query-processor.interface :as qp.i]
-            [metabase.mbql.util :as mbql.u]
             [metabase.query-processor.util :as qputil]
-            [metabase.driver.sql.util.unprepare :as unprepare]
-            [metabase.query-processor.context :as context]
-            [metabase.query-processor.reducible :as qp.reducible]))
+            [metabase.driver.sql.util.unprepare :as unprepare]))
   
 (driver/register! :datasette, :parent :sqlite)
   
@@ -47,14 +43,6 @@
           500 (throw (Exception. (format "Internal server error: %s" body)))
           :else (throw (Exception. (format "Unknown error. Body: %s" body))))))))
 
-
-(defn- get-endpoint-data
-  "Get a datasette definition from an endpoint URL."
-  [{{:keys [datasette_endpoint]} :details, :as database}]
-  (let [resp   (make-request datasette_endpoint nil database)
-        body   (:body resp)]
-    body))
-
 (defn- get-database-json
   "Retrieve the database definition from the Datasette endpoint."
   [{{:keys [datasette_endpoint]} :details, :as database}]
@@ -76,27 +64,49 @@
   (let [datasette-def (get-database-json database)]
   {:tables (set (for [table-def (:tables datasette-def)] {:name (:name table-def), :schema nil}))}))
 
+; Based on the sample data that gets returned, try to infer the column type
+(defn- infer-type
+  [sample-data]
+  (cond
+    ; If everything in the sample data is a 1 or a 0, it's _probably_ a boolean
+    (= (clojure.set/union (set sample-data) #{0 1}) #{0 1}) :type/Boolean
+
+    ; If everything matches a date-time format, probably DateTime!
+    (= (set (for [row sample-data]  (and
+                                      (= (type row) String)
+                                      (not= (re-matches #"\d{4}-\d{2}-\d{2}[T\s]\d\d:\d\d:\d\d.*" row) nil))
+                                    )) #{true}) :type/DateTime
+
+    ; If everything is just a date, probably Date!
+    (= (set (for [row sample-data]  (and
+                                      (= (type row) String)
+                                      (not= (re-matches #"\d{4}-\d{2}-\d{2}" row) nil)))) #{true}) :type/Date
+
+    ; If everything is an Integer or BigInteger, let's default to BigInteger
+    (= (set (for [row sample-data] (or (= (type row) Integer) (= (type row) BigInteger)))) #{true}) :type/BigInteger
+
+    ; OK, fine, default to Text
+    :else :type/Text))
+
+; Build the Metabase field definition
+(defn- mk-field-def
+  [table-def field-idx]
+  (let [field         (get (:columns table-def) field-idx)
+        column-data   (for [row (:rows table-def)]
+                        (get row field-idx))]
+    {:name field
+     :base-type (infer-type column-data)
+     :database-type "some.Random.String"}))
+
 ;;; ----------------------------- describe-table -------------------------------
 (defmethod driver/describe-table :datasette
   [_ database table]
   (let [table-def     (get-table-json database table)
         res           (merge {:name   (:name table)
                               :schema (:schema table)
-                              :fields (set (for [field (:columns table-def)]
-                                             {:name field
-                                              :base-type :type/Text
-                                              :database-type "some.Random.String"}))} ; Is database-type the raw type from the DB?
+                              :fields (set (map-indexed (fn [idx _] (mk-field-def table-def idx)) (:columns table-def)))}
                              (when-let [val (if-not (clojure.string/blank? (:description table-def)) (:description table-def))]
                                {:description val}))]
-    res)
-  )
-
-(defn create-record [data]
-  (let [res (merge {:username (data :username)
-                    :first-name (get-in data [:user-info :name :first])
-                    :last-name (get-in data [:user-info :name :last])}
-                   (when-let [gender (get-in data [:user-info :sex])]
-                     {:gender gender}))]
     res))
 
 ;;; --------------------------------- query execution ------------------------------------------------------------
